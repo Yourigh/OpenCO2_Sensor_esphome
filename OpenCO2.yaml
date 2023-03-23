@@ -1,0 +1,243 @@
+esphome:
+  name: openco2
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: set_state_empty
+  on_shutdown: #works when going to sleep
+    priority: 700
+    then:
+      - switch.turn_off: LED_power
+      - switch.turn_off: EPD_power
+
+esp32:
+  board: lolin_s2_mini
+  variant: esp32s2
+
+wifi:
+  fast_connect: true #no network scan, connect directly
+  power_save_mode: HIGH #change to LIGHT or remove if there are connection problems.
+  ssid: !secret wifi_home_ssid
+  password: !secret wifi_home_pass
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "ESP32_openCO2"
+    password: "esp32s2openco2"
+
+captive_portal:
+
+# Enable logging
+logger:
+  level: NONE 
+  # DEBUG, NONE, INFO
+
+# Enable Home Assistant API
+api:
+
+ota:
+
+deep_sleep:
+  id: deep_sleep_1
+#  run_duration:
+#    default: 65s #will be put to sleep by the sensor automation in 30s
+#    gpio_wakeup_reason: 10min
+#  wakeup_pin_mode: KEEP_AWAKE
+#  wakeup_pin:
+#    number: 0
+#    inverted: true
+#    mode:
+#      input: true
+#      pullup: true
+#https://esphome.io/components/deep_sleep.html?highlight=deep_sleep
+
+switch:
+  - platform: gpio
+    id: LED_power
+    name: LED power
+    pin: 9
+    inverted: true
+    #restore_mode: ALWAYS_ON
+    internal: true
+  - platform: gpio
+    pin: 45
+    id: EPD_power
+    name: EPD power
+    inverted: false
+    restore_mode: ALWAYS_ON
+    internal: true
+
+#binary_sensor:
+#  - platform: gpio
+#    pin: 0
+#    name: "OpenCO2 button"
+#    id: btn0
+#    internal: true
+
+sensor:
+  - platform: scd4x
+    id: my_scd40
+    measurement_mode: low_power_periodic
+    update_interval: 30s
+    temperature_offset: 0.0
+    co2:
+      name: "ppm CO2"
+      id: scd40_ppm
+    temperature:
+      name: "SDC40 Temperature"
+      id: scd40_t
+    humidity:
+      name: "SDC40 Humidity"
+      id: scd40_rh
+      on_value: #on last entry, so temperature and ppm is known.
+        if:
+          condition:
+            sensor.in_range:
+              id: usb_adc
+              below: 1.0
+          then:
+          - component.update: EPD
+          - delay: 5s
+          - deep_sleep.enter:
+              id: deep_sleep_1
+              sleep_duration: 5min
+          else:
+          - component.update: EPD
+          - delay: 5s
+  - platform: adc
+    pin: 5
+    name: "OpenCO2 BattV"
+    attenuation: 11db
+    id: battV
+    update_interval: 20s
+    filters:
+      - multiply: 2
+    on_value_range:
+      - below: 3.35
+        then:
+          - script.execute: set_state_discharged
+          - component.update: EPD
+          - delay: 6s
+          - script.execute: low_battery_shutdown
+  - platform: adc
+    pin: 4
+    attenuation: 11db
+    name: "USB Present"
+    id: usb_adc
+    update_interval: 15s
+    internal: true
+    on_value_range:
+      - above: 1.0
+        then:
+          - deep_sleep.prevent: deep_sleep_1
+      - below: 0.8
+        then:
+          - deep_sleep.allow: deep_sleep_1
+          - script.execute: set_state_empty
+
+script:
+  - id: set_state_empty
+    then:
+      lambda: |-
+        if(analogRead(4)<1024) //if USB is present, update display directly.
+          id(system_state).publish_state("___ Open CO2 ___");
+        else {
+          id(system_state).publish_state("___ Open CO2 USB ___");
+          id(EPD).update();
+        }
+  - id: set_state_discharged
+    then:
+      lambda: |-
+        id(system_state).publish_state("DISCHARGED!!!");
+  - id: low_battery_shutdown
+    then:
+      lambda: |-
+        ESP_LOGD("vbat","Low batt / charger analogRead %0.3f ,if below 1V, shutdown", id(usb_adc).state);
+        if(id(usb_adc).state<1.0) //charger not present 4095 full scale
+        {
+          esp_deep_sleep_start(); //never wake up - only by RESET
+          ESP_LOGE("vbat", "Low Power Supply %.3fV! Sleeping to protect battery", id(battV).state);
+        } 
+        else
+        {
+          ESP_LOGI("vbat","On charger, staying on.");
+        }
+
+i2c:
+  sda: 33
+  scl: 34
+  scan: false
+  id: bus_a
+
+font:
+    - file: 'config\esphome\arial.ttf'
+      id: font1
+      size: 20
+    
+    - file: 'config\esphome\BebasNeue-Regular.ttf'
+      id: font2
+      size: 30
+    
+    - file: 'config\esphome\arial.ttf'
+      id: font3
+      size: 65
+
+spi:
+  clk_pin: 41
+  mosi_pin: 21
+  id: disp_spi
+
+display:
+  - platform: waveshare_epaper
+    spi_id: disp_spi
+    id: EPD
+    rotation: 270°
+    cs_pin: 42
+    dc_pin: 8
+    busy_pin: 6
+    reset_pin: 7
+    reset_duration: 2ms
+    model: 1.54inv2
+    update_interval: never
+    full_update_every: 1 #has to be 1, full update every update. Partial did not work.
+    lambda: |-
+      //it.printf(100, 0, id(font1), TextAlign::TOP_CENTER , "%s",  id(current_ip).state.c_str());
+      it.printf(100, 0, id(font1), TextAlign::TOP_CENTER , "%s",  id(system_state).state.c_str());
+      it.printf(100, 15, id(font3), TextAlign::TOP_CENTER , "%.0f", id(scd40_ppm).state);
+      it.printf(100, 85, id(font2), TextAlign::TOP_CENTER , "%.1f °C", id(scd40_t).state);
+      it.printf(100, 125, id(font2), TextAlign::TOP_CENTER , "%.0f RH", id(scd40_rh).state);
+      it.printf(100, 165, id(font2), TextAlign::TOP_CENTER , "%.2f V", id(battV).state);
+      
+
+text_sensor:
+#  - platform: wifi_info
+#    ip_address:
+#      name: ESP IP Address
+#      id: current_ip
+  - platform: template
+    name: Open CO2 state
+    id: system_state
+    internal: true
+
+#light:
+#  - platform: neopixelbus
+#    #method: ESP32_I2S_0
+#    type: BRG
+#    variant: DotStar
+#    data_pin: 40
+#    clock_pin: 39
+#    num_leds: 1
+#    name: "LED"
+#    id: "led_rgb"
+
+##blink
+#interval:
+#  - interval: 15s
+#    then:
+#      - light.turn_on:
+#          id: led_rgb
+#          brightness: 100%
+#          red: 0
+#          green: 100%
+#          blue: 0.1
+#      - delay: 5s
+#      - light.turn_off: led_rgb    
